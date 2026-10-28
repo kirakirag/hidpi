@@ -1,0 +1,125 @@
+#!/bin/zsh
+# hidpi: native HiDPI ("Retina") modes for non-Retina external displays via display overrides.
+# Usage: ./hidpi list | ./hidpi install --dry-run | sudo ./hidpi install | sudo ./hidpi uninstall
+# Reboot after install/uninstall.
+set -u
+
+OVERRIDES=/Library/Displays/Contents/Resources/Overrides
+WINDOWSERVER=/Library/Preferences/com.apple.windowserver
+MARKER=" (HiDPI)"  # suffix on DisplayProductName marks files this tool wrote
+
+die() { print -u2 -- "$1"; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "needs root: run with sudo"; }
+
+# Big-endian uint32s, base64-encoded for plutil -data.
+be() {
+  local hex="" v
+  for v in "$@"; do hex+=$(printf '%08x' $v); done
+  print -n $hex | xxd -r -p | base64
+}
+
+is_ours() {
+  [[ -f $1 ]] && [[ $(plutil -extract DisplayProductName raw "$1" 2>/dev/null) == *"$MARKER" ]]
+}
+
+# One line per external display: vendor product width height refresh name
+# Native size and IDs come from DisplayHints (EDID-based), which doesn't change when a HiDPI mode is active.
+displays() {
+  local reg=$(ioreg -lw0) hints uuid w h name vendor product refresh
+  print -r -- $reg | grep -ao '"DisplayHints" = {[^}]*}' | sort -u | while read -r hints; do
+    [[ $hints =~ '"EDID UUID"="([0-9A-Fa-f]{8})' ]] && uuid=$match[1] || continue
+    [[ $hints =~ '"MaxW"=([0-9]+)' ]] && w=$match[1] || continue
+    [[ $hints =~ '"MaxH"=([0-9]+)' ]] && h=$match[1] || continue
+    [[ $hints =~ '"ProductName"="([^"]*)"' ]] && name=$match[1] || name="Display $uuid"
+    vendor=$(printf '%x' $((16#${uuid[1,4]})))
+    product=$(printf '%x' $((16#${uuid[7,8]}${uuid[5,6]})))  # EDID stores it little-endian
+    refresh=$(print -r -- $reg | grep -a "\"LegacyManufacturerID\"=$((16#$vendor))[,}]" \
+      | grep -a "\"ProductID\"=$((16#$product))[,}]" | grep -aoE '"MaximumRefreshRate"=[0-9]+' | head -1 | cut -d= -f2)
+    print -r -- "$vendor $product $w $h ${refresh:-60} $name"
+  done
+}
+
+# Looks-like sizes from native-64 down to 75% of native; macOS rejects HiDPI at exactly native size.
+sizes() {
+  local w=$1 h=$2 sw
+  for ((sw = w - 64; sw >= w * 3 / 4; sw -= 64)); do
+    print "$sw $(( (sw * h + w) / (2 * w) * 2 ))"
+  done
+}
+
+write_plist() {  # file vendor product width height refresh name
+  local f=$1 vendor=$2 product=$3 w=$4 h=$5 refresh=$6 name=$7 sw sh
+  rm -f $f
+  plutil -create xml1 $f || return 1
+  plutil -insert DisplayProductName -string "$name$MARKER" $f
+  plutil -insert DisplayVendorID -integer $((16#$vendor)) $f
+  plutil -insert DisplayProductID -integer $((16#$product)) $f
+  plutil -insert scale-resolutions -array $f
+  sizes $w $h | while read -r sw sh; do
+    # Per size: HiDPI mode, its 2x backing size, and the 1x size.
+    plutil -insert scale-resolutions -data $(be $((sw * 2)) $((sh * 2)) 9 0x200000) -append $f
+    plutil -insert scale-resolutions -data $(be $((sw * 2)) $((sh * 2))) -append $f
+    plutil -insert scale-resolutions -data $(be $sw $sh) -append $f
+  done
+  read -r sw sh <<< $(sizes $w $h | head -1)
+  plutil -insert default-resolution -data $(be $sw $sh $(( refresh << 16 | 0xffff ))) $f
+}
+
+case ${1:-list} in
+  list)
+    displays | while read -r vendor product w h refresh name; do
+      f=$OVERRIDES/DisplayVendorID-$vendor/DisplayProductID-$product
+      state=none
+      [[ -f $f ]] && { is_ours $f && state=installed || state="foreign override"; }
+      skip=""; (( w >= 3840 )) && skip=" (already HiDPI-capable, skipped)"
+      print -r -- "$name: ${w}x$h @${refresh}Hz, vendor $vendor product $product, override: $state$skip"
+    done
+    ;;
+
+  install)
+    dry=0; [[ ${2:-} == --dry-run ]] && dry=1
+    (( dry )) || need_root
+    found=0
+    while read -r vendor product w h refresh name; do
+      (( w >= 3840 )) && continue  # 4K and up already get HiDPI modes
+      found=1
+      f=$OVERRIDES/DisplayVendorID-$vendor/DisplayProductID-$product
+      print -r -- "$name -> $f"
+      print -r -- "  HiDPI sizes: $(sizes $w $h | tr ' ' x | paste -sd, - | sed 's/,/, /g')"
+      print -r -- "  default: $(sizes $w $h | head -1 | tr ' ' x) @${refresh}Hz"
+      if (( dry )); then
+        tmp=$(mktemp)
+        write_plist $tmp $vendor $product $w $h $refresh "$name"
+        plutil -p $tmp | sed 's/^/  /'
+        rm -f $tmp
+        continue
+      fi
+      mkdir -p ${f:h} || die "  failed to create ${f:h}"
+      if [[ -f $f ]] && ! is_ours $f && [[ ! -f $f.bak ]]; then
+        mv $f $f.bak && print -r -- "  backed up existing override to $f.bak"
+      fi
+      write_plist $f $vendor $product $w $h $refresh "$name" || die "  failed to write $f"
+    done < <(displays)
+    (( found )) || die "no non-Retina external displays found"
+    if (( ! dry )); then
+      defaults write $WINDOWSERVER DisplayResolutionEnabled -bool YES
+      print "Done. Reboot, then pick a HiDPI size in System Settings > Displays."
+    fi
+    ;;
+
+  uninstall)
+    need_root
+    for f in $OVERRIDES/DisplayVendorID-*/DisplayProductID-*(N); do
+      [[ $f == *.bak ]] && continue
+      is_ours $f || continue
+      rm -f $f
+      [[ -f $f.bak ]] && mv $f.bak $f
+      print -r -- "removed $f"
+      rmdir ${f:h} 2>/dev/null
+    done
+    defaults delete $WINDOWSERVER DisplayResolutionEnabled 2>/dev/null
+    print "Done. Reboot to return to stock modes."
+    ;;
+
+  *) die "usage: hidpi list | hidpi install --dry-run | sudo hidpi install | sudo hidpi uninstall" ;;
+esac

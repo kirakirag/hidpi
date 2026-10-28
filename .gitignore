@@ -1,0 +1,7 @@
+modes
+modes.swift
+override/
+.remember/
+.DS_Store
+.claude/
+MonitorControl/
